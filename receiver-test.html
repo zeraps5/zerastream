@@ -3,7 +3,7 @@
 <style>
 html,body{margin:0;width:100%;height:100%;background:#14161a;overflow:hidden;color:#f4f4f2;font:16px sans-serif}
 #picture,#screen{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;background:#000;display:block}
-#screen{display:none}#picture.canvas-source{width:2px;height:2px;inset:auto;bottom:0;left:0;opacity:.01}
+#screen{display:none;z-index:1}#picture.canvas-source{width:2px;height:2px;inset:auto;bottom:0;left:0;opacity:.01}
 #caf{position:fixed;width:1px;height:1px;opacity:.01;pointer-events:none}
 #state{position:fixed;left:16px;bottom:16px;max-width:calc(100vw - 64px);padding:12px;border:1px solid #b6ff3b;background:#14161aeb;white-space:pre-line;z-index:2}
 </style><script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script></head>
@@ -15,11 +15,32 @@ const NS='urn:x-cast:zerastream';
 const video=document.getElementById('picture'),screen=document.getElementById('screen'),panel=document.getElementById('state');
 let context=null,sender=null,connection=null,media=null,source=null,blob=null,generation=0,retry=null;
 let frames=[],bytes=0,received=0,codec='',issue='',endpoint='',renderer='video',lastReport=0;
-let starting=true,playing=false;
+let starting=true,playing=false,jpegFrames=0,jpegBusy=false,jpegNext=null,pixelReport=null;
 function chooseRenderer(mode){
- renderer=mode==='canvas'?'canvas':'video';
+ renderer=['canvas','calibration','jpeg'].includes(mode)?mode:'video';
  video.classList.toggle('canvas-source',renderer==='canvas');
- screen.style.display=renderer==='canvas'?'block':'none';
+ video.style.display=['calibration','jpeg'].includes(renderer)?'none':'block';
+ screen.style.display=renderer!=='video'?'block':'none';
+ if(renderer==='calibration'){generation++;cleanup();screen.width=1280;screen.height=720;received=0;issue='';}
+}
+function samplePixels(){
+ try{
+  const ctx=screen.getContext('2d'),samples=[];
+  for(const [x,y] of [[.1,.4],[.3,.4],[.5,.4],[.7,.4],[.9,.4]]){
+   samples.push(Array.from(ctx.getImageData(Math.floor(screen.width*x),Math.floor(screen.height*y),1,1).data).slice(0,3));
+  }
+  pixelReport={samples,canvasWidth:screen.width,canvasHeight:screen.height,display:getComputedStyle(screen).display,rect:{width:screen.getBoundingClientRect().width,height:screen.getBoundingClientRect().height}};
+ }catch(error){pixelReport={error:error.name};}
+}
+async function drawJpeg(data){
+ if(jpegBusy){jpegNext=data;return;}
+ jpegBusy=true;
+ try{
+  const image=await createImageBitmap(new Blob([data],{type:'image/jpeg'}));
+  screen.width=image.width;screen.height=image.height;
+  screen.getContext('2d').drawImage(image,0,0);image.close();jpegFrames++;playing=true;
+ }catch(error){fail('JPEG: '+error.name);}
+ finally{jpegBusy=false;if(jpegNext){const next=jpegNext;jpegNext=null;drawJpeg(next);}}
 }
 function codecFromInit(data){
  for(let i=4;i+8<data.length;i++)if(data[i]===0x61&&data[i+1]===0x76&&data[i+2]===0x63&&data[i+3]===0x43){
@@ -46,12 +67,13 @@ function connect(url){
  const parsed=new URL(url);
  if(!['ws:','wss:'].includes(parsed.protocol))throw Error('Expected a WebSocket stream');
  generation++;const ownGeneration=generation;
- cleanup();endpoint=url;received=0;issue='';
+ cleanup();endpoint=url;received=0;issue='';jpegFrames=0;
  let initial=true;
  const ws=new WebSocket(url);connection=ws;ws.binaryType='arraybuffer';
  ws.onmessage=event=>{
   if(ownGeneration!==generation||!(event.data instanceof ArrayBuffer))return;
   const data=new Uint8Array(event.data);received++;
+  if(renderer==='jpeg'){drawJpeg(data);return;}
   try{
    if(initial){
     initial=false;codec=codecFromInit(data);
@@ -84,14 +106,21 @@ video.addEventListener('waiting',()=>{playing=false;});
 function status(){
  const end=video.buffered.length?video.buffered.end(video.buffered.length-1):0;
  const quality=video.getVideoPlaybackQuality?video.getVideoPlaybackQuality():null;
- return {type:'receiver-test-status',renderer,codec,received,queued:frames.length,bufferedEnd:end,time:video.currentTime,lag:Math.max(0,end-video.currentTime),paused:video.paused,readyState:video.readyState,width:video.videoWidth,height:video.videoHeight,decoded:quality?quality.totalVideoFrames:null,dropped:quality?quality.droppedVideoFrames:null,error:issue};
+ return {type:'receiver-test-status',revision:2,renderer,codec,received,queued:frames.length,bufferedEnd:end,time:video.currentTime,lag:Math.max(0,end-video.currentTime),paused:video.paused,readyState:video.readyState,width:video.videoWidth,height:video.videoHeight,decoded:quality?quality.totalVideoFrames:null,dropped:quality?quality.droppedVideoFrames:null,jpegFrames,pixels:pixelReport,error:issue};
 }
 function tick(now){
  const state=status();
- if(state.bufferedEnd>0){
+ if(!['calibration','jpeg'].includes(renderer)&&state.bufferedEnd>0){
   if(starting&&state.bufferedEnd>=.6){starting=false;video.currentTime=Math.max(0,state.bufferedEnd-.5);video.play().catch(error=>fail('Play: '+error.name));}
   if(!starting&&!video.seeking&&video.readyState>=3&&state.lag>1.5){video.currentTime=Math.max(0,state.bufferedEnd-.5);}
   if(!starting&&video.paused)video.play().catch(error=>fail('Play: '+error.name));
+ }
+ if(renderer==='calibration'){
+  const c=screen.getContext('2d'),colors=['#f00','#0f0','#00f','#ff0','#0ff','#f0f'];
+  colors.forEach((color,i)=>{c.fillStyle=color;c.fillRect(i*screen.width/6,0,screen.width/6,screen.height);});
+  c.fillStyle='#14161a';c.fillRect(32,32,1216,180);c.fillStyle='#fff';c.font='bold 50px sans-serif';
+  c.fillText('ZERA STREAM — CANVAS TEST',55,105);c.fillText(Math.floor(now/1000)+' seconds',55,178);
+  c.fillStyle='#fff';c.fillRect((now/8)%(screen.width-100),screen.height-140,100,100);
  }
  if(renderer==='canvas'&&video.videoWidth&&video.readyState>=2){
   if(screen.width!==video.videoWidth||screen.height!==video.videoHeight){screen.width=video.videoWidth;screen.height=video.videoHeight;}
@@ -99,7 +128,8 @@ function tick(now){
  }
  if(now-lastReport>1000){
   lastReport=now;
-  panel.textContent='Zera Stream — receiver test\n'+renderer+' | '+(playing?'playing':'waiting')+' | '+state.width+'×'+state.height+' | '+Math.round(state.lag*1000)+' ms\nPackets '+received+' | frames '+state.decoded+' | queue '+frames.length+' | '+codec+(issue?'\n'+issue:'');
+  if(renderer!=='video')samplePixels();
+  panel.textContent='Zera Stream — receiver test v2\n'+renderer+' | '+(playing?'playing':'waiting')+' | '+state.width+'×'+state.height+' | '+Math.round(state.lag*1000)+' ms\nPackets '+received+' | video frames '+state.decoded+' | JPEG frames '+jpegFrames+' | queue '+frames.length+' | '+codec+(issue?'\n'+issue:'');
   panel.dataset.playback=JSON.stringify(state);
   if(context&&sender){try{context.sendCustomMessage(NS,sender,state);}catch(error){/* Diagnostics must not stop playback. */}}
  }
